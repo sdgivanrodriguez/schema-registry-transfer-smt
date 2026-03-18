@@ -1,7 +1,6 @@
 /* Licensed under Apache-2.0 */
 package cricket.jmoore.kafka.connect.transforms;
 
-import static java.net.HttpURLConnection.HTTP_NOT_FOUND;
 
 import java.io.IOException;
 import java.util.List;
@@ -16,12 +15,13 @@ import org.junit.jupiter.api.extension.ExtensionContext;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import io.confluent.kafka.schemaregistry.ParsedSchema;
+import io.confluent.kafka.schemaregistry.avro.AvroSchema;
 import io.confluent.kafka.schemaregistry.client.CachedSchemaRegistryClient;
 import io.confluent.kafka.schemaregistry.client.MockSchemaRegistryClient;
 import io.confluent.kafka.schemaregistry.client.SchemaMetadata;
 import io.confluent.kafka.schemaregistry.client.SchemaRegistryClient;
 import io.confluent.kafka.schemaregistry.client.rest.entities.Config;
-import io.confluent.kafka.schemaregistry.client.rest.entities.SchemaString;
 import io.confluent.kafka.schemaregistry.client.rest.entities.requests.RegisterSchemaRequest;
 import io.confluent.kafka.schemaregistry.client.rest.entities.requests.RegisterSchemaResponse;
 import io.confluent.kafka.schemaregistry.client.rest.exceptions.RestClientException;
@@ -30,7 +30,6 @@ import io.confluent.kafka.serializers.subject.strategy.SubjectNameStrategy;
 
 import com.github.tomakehurst.wiremock.WireMockServer;
 import com.github.tomakehurst.wiremock.client.MappingBuilder;
-import com.github.tomakehurst.wiremock.client.ResponseDefinitionBuilder;
 import com.github.tomakehurst.wiremock.client.WireMock;
 import com.github.tomakehurst.wiremock.common.FileSource;
 import com.github.tomakehurst.wiremock.core.WireMockConfiguration;
@@ -107,10 +106,11 @@ public class SchemaRegistryMock implements BeforeEachCallback, AfterEachCallback
     private final GetVersionHandler getVersionHandler = new GetVersionHandler();
     private final AutoRegistrationHandler autoRegistrationHandler = new AutoRegistrationHandler();
     private final GetConfigHandler getConfigHandler = new GetConfigHandler();
+    private final SchemaByIdHandler schemaByIdHandler = new SchemaByIdHandler();
     private final WireMockServer mockSchemaRegistry = new WireMockServer(
             WireMockConfiguration.wireMockConfig().dynamicPort().extensions(
                     this.autoRegistrationHandler, this.listVersionsHandler, this.getVersionHandler,
-                    this.getConfigHandler));
+                    this.getConfigHandler, this.schemaByIdHandler));
     private final SchemaRegistryClient schemaRegistryClient = new MockSchemaRegistryClient();
     private final String basicAuthTag;
     private final String basicAuthCredentials;
@@ -123,9 +123,11 @@ public class SchemaRegistryMock implements BeforeEachCallback, AfterEachCallback
             throw new IllegalArgumentException("Role must be either SOURCE or DESTINATION");
         }
 
-        this.basicAuthTag = (role == Role.SOURCE) ? Constants.USE_BASIC_AUTH_SOURCE_TAG : Constants.USE_BASIC_AUTH_DEST_TAG; 
+        this.basicAuthTag =
+                (role == Role.SOURCE) ? Constants.USE_BASIC_AUTH_SOURCE_TAG : Constants.USE_BASIC_AUTH_DEST_TAG;
         this.basicAuthCredentials =
-            (role == Role.SOURCE)? Constants.HTTP_AUTH_SOURCE_CREDENTIALS_FIXTURE : Constants.HTTP_AUTH_DEST_CREDENTIALS_FIXTURE;
+                (role == Role.SOURCE) ? Constants.HTTP_AUTH_SOURCE_CREDENTIALS_FIXTURE
+                        : Constants.HTTP_AUTH_DEST_CREDENTIALS_FIXTURE;
     }
 
     @Override
@@ -152,24 +154,27 @@ public class SchemaRegistryMock implements BeforeEachCallback, AfterEachCallback
                 .willReturn(WireMock.aResponse().withTransformers(this.getVersionHandler.getName())));
         this.stubFor.apply(WireMock.get(WireMock.urlPathMatching(CONFIG_PATTERN))
                 .willReturn(WireMock.aResponse().withTransformers(this.getConfigHandler.getName())));
+        // Schema by ID endpoint - use stubFor to respect authentication settings
         this.stubFor.apply(WireMock.get(WireMock.urlPathMatching(SCHEMA_BY_ID_PATTERN + "\\d+"))
-                .willReturn(WireMock.aResponse().withStatus(HTTP_NOT_FOUND)));
+                .willReturn(WireMock.aResponse().withTransformers(this.schemaByIdHandler.getName())));
     }
 
     public int registerSchema(final String topic, boolean isKey, final Schema schema) {
         return this.registerSchema(topic, isKey, schema, new TopicNameStrategy());
     }
 
-    public int registerSchema(final String topic, boolean isKey, final Schema schema, SubjectNameStrategy<Schema> strategy) {
-        return this.register(strategy.subjectName(topic, isKey, schema), schema);
+    // IMPORTANT CHANGE FOR CONFLUENT 7.x:
+    // SubjectNameStrategy is NOT generic anymore AND it expects a ParsedSchema, not an Avro Schema.
+    public int registerSchema(final String topic, boolean isKey, final Schema schema, final SubjectNameStrategy strategy) {
+        final ParsedSchema parsedSchema = new AvroSchema(schema);
+        return this.register(strategy.subjectName(topic, isKey, parsedSchema), schema);
     }
 
     private int register(final String subject, final Schema schema) {
         try {
-            final int id = this.schemaRegistryClient.register(subject, schema);
-            this.stubFor.apply(WireMock.get(WireMock.urlEqualTo(SCHEMA_BY_ID_PATTERN + id))
-                    .willReturn(ResponseDefinitionBuilder.okForJson(new SchemaString(schema.toString()))));
-            log.debug("Registered schema {}", id);
+            final ParsedSchema parsedSchema = new AvroSchema(schema);
+            final int id = this.schemaRegistryClient.register(subject, parsedSchema);
+            log.debug("Registered schema {} for subject {}", id, subject);
             return id;
         } catch (final IOException | RestClientException e) {
             throw new IllegalStateException("Internal error in mock schema registry client", e);
@@ -236,6 +241,7 @@ public class SchemaRegistryMock implements BeforeEachCallback, AfterEachCallback
     }
 
     private class AutoRegistrationHandler extends SubjectsVersioHandler {
+        private final com.fasterxml.jackson.databind.ObjectMapper mapper = new com.fasterxml.jackson.databind.ObjectMapper();
 
         @Override
         public ResponseDefinition transform(final Request request, final ResponseDefinition responseDefinition,
@@ -246,7 +252,8 @@ public class SchemaRegistryMock implements BeforeEachCallback, AfterEachCallback
                                 .parse(RegisterSchemaRequest.fromJson(request.getBodyAsString()).getSchema()));
                 final RegisterSchemaResponse registerSchemaResponse = new RegisterSchemaResponse();
                 registerSchemaResponse.setId(id);
-                return ResponseDefinitionBuilder.jsonResponse(registerSchemaResponse);
+                String jsonBody = mapper.writeValueAsString(registerSchemaResponse);
+                return new ResponseDefinition(200, jsonBody);
             } catch (final IOException e) {
                 throw new IllegalArgumentException("Cannot parse schema registration request", e);
             }
@@ -259,13 +266,29 @@ public class SchemaRegistryMock implements BeforeEachCallback, AfterEachCallback
     }
 
     private class ListVersionsHandler extends SubjectsVersioHandler {
+        private final com.fasterxml.jackson.databind.ObjectMapper mapper = new com.fasterxml.jackson.databind.ObjectMapper();
 
         @Override
         public ResponseDefinition transform(final Request request, final ResponseDefinition responseDefinition,
                                             final FileSource files, final Parameters parameters) {
-            final List<Integer> versions = SchemaRegistryMock.this.listVersions(getSubject(request));
-            log.debug("Got versions {}", versions);
-            return ResponseDefinitionBuilder.jsonResponse(versions);
+            try {
+                final List<Integer> versions = SchemaRegistryMock.this.listVersions(getSubject(request));
+                log.debug("Got versions {}", versions);
+                String jsonBody = mapper.writeValueAsString(versions);
+                return new ResponseDefinition(200, jsonBody);
+            } catch (IllegalStateException e) {
+                // Subject not found - return empty list instead of 404
+                // This matches MockSchemaRegistryClient behavior
+                log.debug("Subject not found, returning empty list: {}", getSubject(request));
+                try {
+                    String jsonBody = mapper.writeValueAsString(java.util.Collections.emptyList());
+                    return new ResponseDefinition(200, jsonBody);
+                } catch (final IOException ex) {
+                    throw new IllegalStateException("Cannot serialize empty list", ex);
+                }
+            } catch (final IOException e) {
+                throw new IllegalStateException("Cannot serialize versions", e);
+            }
         }
 
         @Override
@@ -275,19 +298,39 @@ public class SchemaRegistryMock implements BeforeEachCallback, AfterEachCallback
     }
 
     private class GetVersionHandler extends SubjectsVersioHandler {
+        private final com.fasterxml.jackson.databind.ObjectMapper mapper = new com.fasterxml.jackson.databind.ObjectMapper();
 
         @Override
         public ResponseDefinition transform(final Request request, final ResponseDefinition responseDefinition,
                                             final FileSource files, final Parameters parameters) {
-            String versionStr = Iterables.get(this.urlSplitter.split(request.getUrl()), 3);
-            SchemaMetadata metadata;
-            if (versionStr.equals("latest")) {
-                metadata = SchemaRegistryMock.this.getSubjectVersion(getSubject(request), versionStr);
-            } else {
-                int version = Integer.parseInt(versionStr);
-                metadata = SchemaRegistryMock.this.getSubjectVersion(getSubject(request), version);
+            try {
+                // Remove query parameters if present
+                String url = request.getUrl();
+                if (url.contains("?")) {
+                    url = url.substring(0, url.indexOf("?"));
+                }
+                
+                String versionStr = Iterables.get(this.urlSplitter.split(url), 3);
+                SchemaMetadata metadata;
+                if (versionStr.equals("latest")) {
+                    metadata = SchemaRegistryMock.this.getSubjectVersion(getSubject(request), versionStr);
+                } else {
+                    int version = Integer.parseInt(versionStr);
+                    metadata = SchemaRegistryMock.this.getSubjectVersion(getSubject(request), version);
+                }
+                String jsonBody = mapper.writeValueAsString(metadata);
+                return new ResponseDefinition(200, jsonBody);
+            } catch (NumberFormatException e) {
+                log.error("Invalid version in URL: {}", request.getUrl());
+                return new ResponseDefinition(422, 
+                    "{\"error_code\":42202,\"message\":\"Invalid version\"}");
+            } catch (IllegalStateException e) {
+                log.debug("Schema or subject not found for URL: {}", request.getUrl());
+                return new ResponseDefinition(404, 
+                    "{\"error_code\":40401,\"message\":\"Subject or version not found\"}");
+            } catch (final IOException e) {
+                throw new IllegalStateException("Cannot serialize metadata", e);
             }
-            return ResponseDefinitionBuilder.jsonResponse(metadata);
         }
 
         @Override
@@ -297,6 +340,7 @@ public class SchemaRegistryMock implements BeforeEachCallback, AfterEachCallback
     }
 
     private class GetConfigHandler extends SubjectsVersioHandler {
+        private final com.fasterxml.jackson.databind.ObjectMapper mapper = new com.fasterxml.jackson.databind.ObjectMapper();
 
         @Override
         protected String getSubject(Request request) {
@@ -311,13 +355,74 @@ public class SchemaRegistryMock implements BeforeEachCallback, AfterEachCallback
         @Override
         public ResponseDefinition transform(final Request request, final ResponseDefinition responseDefinition,
                                             final FileSource files, final Parameters parameters) {
-            Config config = new Config(SchemaRegistryMock.this.getCompatibility(getSubject(request)));
-            return ResponseDefinitionBuilder.jsonResponse(config);
+            try {
+                Config config = new Config(SchemaRegistryMock.this.getCompatibility(getSubject(request)));
+                String jsonBody = mapper.writeValueAsString(config);
+                return new ResponseDefinition(200, jsonBody);
+            } catch (final IOException e) {
+                throw new IllegalStateException("Cannot serialize config", e);
+            }
         }
 
         @Override
         public String getName() {
             return GetConfigHandler.class.getSimpleName();
+        }
+    }
+
+    private class SchemaByIdHandler extends ResponseDefinitionTransformer {
+        private final com.fasterxml.jackson.databind.ObjectMapper mapper = new com.fasterxml.jackson.databind.ObjectMapper();
+
+        @Override
+        public ResponseDefinition transform(final Request request, final ResponseDefinition responseDefinition,
+                                            final FileSource files, final Parameters parameters) {
+            try {
+                // Extract schema ID from URL like /schemas/ids/123 or /schemas/ids/123?fetchMaxId=false
+                String path = request.getUrl();
+                // Remove query parameters if present
+                if (path.contains("?")) {
+                    path = path.substring(0, path.indexOf("?"));
+                }
+                String idStr = path.substring(path.lastIndexOf('/') + 1);
+                int id = Integer.parseInt(idStr);
+                
+                // Get schema from the mock client - returns ParsedSchema in Confluent 7.x
+                ParsedSchema parsedSchema = SchemaRegistryMock.this.schemaRegistryClient.getSchemaById(id);
+                
+                // Convert to Avro Schema
+                String schemaString;
+                if (parsedSchema instanceof AvroSchema) {
+                    schemaString = ((AvroSchema) parsedSchema).canonicalString();
+                } else {
+                    schemaString = parsedSchema.canonicalString();
+                }
+                
+                // Return JSON response: {"schema": "<schema-string>"}
+                com.fasterxml.jackson.databind.node.ObjectNode jsonNode = mapper.createObjectNode();
+                jsonNode.put("schema", schemaString);
+                String jsonBody = mapper.writeValueAsString(jsonNode);
+                
+                log.debug("Returning schema for ID {}: {}", id, schemaString);
+                return new ResponseDefinition(200, jsonBody);
+            } catch (NumberFormatException e) {
+                log.error("Invalid schema ID in URL: {}", request.getUrl());
+                return new ResponseDefinition(400, 
+                    "{\"error_code\":400,\"message\":\"Invalid schema ID\"}");
+            } catch (RestClientException | IOException e) {
+                log.debug("Schema not found for URL: {}", request.getUrl(), e);
+                return new ResponseDefinition(404, 
+                    "{\"error_code\":40403,\"message\":\"Schema not found\"}");
+            }
+        }
+
+        @Override
+        public String getName() {
+            return SchemaByIdHandler.class.getSimpleName();
+        }
+
+        @Override
+        public boolean applyGlobally() {
+            return false;
         }
     }
 
